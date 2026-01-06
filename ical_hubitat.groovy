@@ -12,7 +12,7 @@
  *   - Supports Outlook / Microsoft 365 calendar feeds via calendar-level timezone parsing:
  *       X-WR-TIMEZONE and VTIMEZONE
  *   - Expands common Outlook/M365 weekly RRULEs (BYDAY, INTERVAL, UNTIL, WKST) into concrete instances
- *     within the poll window (windowStart–windowEnd), and applies RECURRENCE-ID overrides.
+ *     within the poll window, and applies RECURRENCE-ID overrides.
  *
  *  Time handling
  *   - DTSTART/DTEND supported forms:
@@ -20,6 +20,11 @@
  *       2) TZID=... parameters
  *       3) Floating times (no TZID, no Z) interpreted using calendar timezone if present, else hub timezone
  *   - Internally uses epoch milliseconds (absolute time); formatted output is always in hub timezone
+ *
+ *  Scheduling model
+ *   - Regular poll runs on pollSeconds cadence (fetch + parse)
+ *   - Transition poll runs at event boundaries and must not be throttled by pollSeconds
+ *   - A small anti-spam throttle (5s) prevents rapid manual or duplicate scheduling calls
  *
  *  License / Attribution
  *   - Free for public use and redistribution, including modified versions
@@ -39,6 +44,8 @@ metadata {
 
         command "initialize"
         command "poll"
+        command "pollRegular"
+        command "pollTransition"
         command "clearDebug"
         command "showNext"
 
@@ -102,11 +109,11 @@ def initialize() {
     debugAdd("Next list: count=${safeInt(nextListCount, 10)}, showLocation=${!!nextListShowLocation}")
     debugAdd("Hub TZ: ${hubTz()?.getID()}")
 
-    runIn(2, "poll")
+    runIn(2, "pollTransition")
 }
 
-def refresh() { poll() }
-def showNext() { poll() }
+def refresh() { pollTransition() }
+def showNext() { pollTransition() }
 
 def clearDebug() {
     state.debugBuf = ""
@@ -124,30 +131,47 @@ def off() {
 }
 
 /* ---------------------------
+   Poll entrypoints
+---------------------------- */
+
+def pollRegular() {
+    poll([force: false, reason: "regular"])
+}
+
+def pollTransition() {
+    poll([force: true, reason: "transition"])
+}
+
+/* ---------------------------
    Main poll logic
 ---------------------------- */
 
-def poll() {
+def poll(Map data = null) {
+    boolean force = (data?.force == true)
+    String reason = (data?.reason ?: "manual") as String
+
     if (!icsUrl?.trim()) {
         sendEvent(name: "lastStatus", value: "Missing ICS URL")
-        debugAdd("Poll aborted: ICS URL is empty.")
+        debugAdd("Poll aborted (${reason}): ICS URL is empty.")
         scheduleNextPoll()
         return
     }
 
     Long nowMs = now()
-    Long lastPoll = (state.lastPollMs instanceof Long) ? state.lastPollMs : 0L
-    Integer minGapMs = Math.max(10, safeInt(pollSeconds, 900)) * 1000
-    if (lastPoll && (nowMs - lastPoll) < minGapMs) {
+
+    // Small anti-spam throttle only. Transition polls must not be blocked by pollSeconds.
+    Long lastPoll = (state.lastPollMs instanceof Long) ? (state.lastPollMs as Long) : 0L
+    Integer minGapMs = 5000
+    if (!force && lastPoll && (nowMs - lastPoll) < minGapMs) {
         Long waitMs = minGapMs - (nowMs - lastPoll)
-        debugAdd("Poll throttled; next poll in ~${Math.round(waitMs / 1000)}s")
-        runIn(Math.max(2, Math.round(waitMs / 1000) as Integer), "poll")
+        debugAdd("Poll throttled (${reason}); next attempt in ~${Math.round(waitMs / 1000)}s")
+        runIn(Math.max(2, Math.round(waitMs / 1000) as Integer), "pollRegular")
         return
     }
     state.lastPollMs = nowMs
 
     sendEvent(name: "lastStatus", value: "Fetching")
-    debugAdd("Fetching ICS: ${icsUrl}")
+    debugAdd("Fetching ICS (${reason}): ${icsUrl}")
 
     String body = null
     Integer statusCode = null
@@ -165,7 +189,7 @@ def poll() {
         }
     } catch (e) {
         sendEvent(name: "lastStatus", value: "Fetch exception")
-        debugAdd("Fetch exception: ${e}")
+        debugAdd("Fetch exception (${reason}): ${e}")
         scheduleNextPoll()
         return
     }
@@ -189,7 +213,6 @@ def poll() {
 
     sendEvent(name: "lastStatus", value: "Parsing")
 
-    // Parse calendar timezone hint first (Outlook-safe)
     TimeZone calTz = detectCalendarTimeZone(body)
     state.calendarTzid = calTz?.getID()
     sendEvent(name: "calendarTz", value: state.calendarTzid)
@@ -201,8 +224,6 @@ def poll() {
     Long windowStart = nowMs - (safeInt(includePastHours, 6) * 3600000L)
     Long windowEnd   = nowMs + (safeInt(horizonDays, 3) * 86400000L)
 
-    // Expand common weekly RRULE masters into concrete instances inside the window.
-    // Apply RECURRENCE-ID overrides (and drop CANCELLED overrides).
     events = expandRecurringEvents(events, windowStart, windowEnd, calTz)
     debugAdd("After RRULE expansion: event instances=${events.size()}")
 
@@ -249,7 +270,6 @@ def poll() {
     sendEvent(name: "activeSummary", value: governing ? formatEventLine(governing, hubTz()) : null)
     sendEvent(name: "nextSummary", value: next ? formatEventLine(next, hubTz()) : null)
 
-    // Next N list
     Integer n = Math.max(0, safeInt(nextListCount, 10))
     String nextEventsText = ""
     if (n > 0) {
@@ -284,10 +304,8 @@ private TimeZone detectCalendarTimeZone(String icsText) {
     TimeZone hub = hubTz()
     if (!icsText) return hub
 
-    // Unfold to make header parsing reliable
     List<String> lines = unfoldLines(icsText)
 
-    // Look for X-WR-TIMEZONE:America/New_York
     String xwr = lines.find { it?.startsWith("X-WR-TIMEZONE:") }
     if (xwr) {
         String tzid = xwr.substring("X-WR-TIMEZONE:".length()).trim()
@@ -296,7 +314,6 @@ private TimeZone detectCalendarTimeZone(String icsText) {
         if (tz && tz.getID() != "GMT") return tz
     }
 
-    // Some calendars use TZID: in VTIMEZONE blocks; extract first TZID seen there
     Integer vtzIdx = lines.findIndexOf { it == "BEGIN:VTIMEZONE" }
     if (vtzIdx >= 0) {
         for (int i = vtzIdx; i < Math.min(lines.size(), vtzIdx + 80); i++) {
@@ -396,13 +413,13 @@ private void scheduleNextTransition(List<Map> activeNow, Map next, Long nowMs) {
     }
 
     state.nextTransitionAtMs = targetMs
-    runIn(seconds, "poll")
+    runIn(seconds, "pollTransition")
     debugAdd("Scheduled transition (${why}) in ${seconds}s at ${fmtStamp(new Date(targetMs), hubTz())}")
 }
 
 private void scheduleNextPoll() {
     Integer s = Math.max(30, safeInt(pollSeconds, 900))
-    runIn(s, "poll")
+    runIn(s, "pollRegular")
     debugAdd("Scheduled regular poll in ${s}s")
 }
 
@@ -499,11 +516,9 @@ private Map buildEvent(Map raw, TimeZone calendarTz) {
     String location = unescapeIcsText((p.LOCATION?.value ?: "") as String)
     String uid = (p.UID?.value ?: "") as String
 
-    // RRULE (recurrence master)
     String rrule = ((p.RRULE?.value ?: "") as String).trim()
     if (!rrule) rrule = null
 
-    // RECURRENCE-ID (override instance)
     Long recurrenceIdMs = null
     if (p["RECURRENCE-ID"]?.value) {
         Map rid = p["RECURRENCE-ID"]
@@ -535,7 +550,6 @@ private Map buildEvent(Map raw, TimeZone calendarTz) {
         durationMs    : durationMs,
         allDay        : isAllDayValue(ds.value as String),
 
-        // recurrence support
         rrule         : rrule,
         recurrenceIdMs: recurrenceIdMs,
         recTzId       : tzRec?.getID()
@@ -548,17 +562,10 @@ private TimeZone tzFromParams(Map params) {
     if (!tzid) return null
     tzid = tzid.replace("\"", "")
     TimeZone tz = TimeZone.getTimeZone(tzid)
-    // If unknown, Java returns GMT; treat that as null so we can fall back.
     if (tz?.getID() == "GMT" && tzid != "GMT") return null
     return tz
 }
 
-/**
- * Parse iCal date/time:
- *  - If endsWith Z -> UTC absolute time
- *  - If no T -> all-day date in tzContext/calendarTz/hubTz
- *  - If floating (no Z, no TZID) -> interpret in calendarTz if present, else hubTz
- */
 private Date parseICalDate(String rawVal, TimeZone tzContext, TimeZone calendarTz) {
     if (!rawVal) return null
 
@@ -578,7 +585,6 @@ private Date parseICalDate(String rawVal, TimeZone tzContext, TimeZone calendarT
         return tryParse(v, "yyyyMMdd", tz)
     }
 
-    // Floating/local datetime
     TimeZone tz = tzContext ?: (calendarTz ?: hub)
     Date d = tryParse(v, "yyyyMMdd'T'HHmmss", tz)
     if (d) return d
@@ -605,7 +611,6 @@ private boolean isAllDayValue(String rawVal) {
     (!v.contains("T")) && (v.length() == 8)
 }
 
-// Unfold iCal lines: lines beginning with space/tab continue previous line.
 private List<String> unfoldLines(String text) {
     List<String> raw = text.replace("\r\n", "\n").split("\n") as List<String>
     List<String> out = []
@@ -624,7 +629,6 @@ private List<String> unfoldLines(String text) {
     return out
 }
 
-// iCal text escaping: \n, \, \;, \,
 private String unescapeIcsText(String s) {
     if (s == null) return ""
     String out = s
@@ -640,11 +644,9 @@ private String unescapeIcsText(String s) {
    RRULE expansion (WEEKLY)
 ---------------------------- */
 
-// Expand weekly RRULE masters into concrete in-window instances, applying RECURRENCE-ID overrides.
 private List<Map> expandRecurringEvents(List<Map> events, Long windowStart, Long windowEnd, TimeZone calendarTz) {
     if (!events) return []
 
-    // Overrides keyed by UID + recurrenceIdMs
     Map<String, Map> overrides = [:]
     events.findAll { it?.recurrenceIdMs instanceof Long }.each { ev ->
         String k = "${ev.uid}@@${ev.recurrenceIdMs as Long}"
@@ -653,26 +655,22 @@ private List<Map> expandRecurringEvents(List<Map> events, Long windowStart, Long
 
     List<Map> out = []
 
-    // Pass through all events that are not RRULE masters (including override instances themselves)
     events.each { ev ->
         if (!ev) return
         boolean isMasterWithRrule = (ev.rrule instanceof String) && !(ev.recurrenceIdMs instanceof Long)
         if (!isMasterWithRrule) out << ev
     }
 
-    // Expand RRULE masters
     events.findAll { it?.rrule && !(it?.recurrenceIdMs instanceof Long) }.each { master ->
         out.addAll(expandWeeklyMaster(master, windowStart, windowEnd, calendarTz, overrides))
     }
 
-    // Sort and return
     out = out.findAll { it?.startMs && it?.endMs }
              .sort { a, b -> (a.startMs as Long) <=> (b.startMs as Long) }
 
     return out
 }
 
-// Supports common Outlook patterns: FREQ=WEEKLY;INTERVAL=...;BYDAY=...;UNTIL=...;WKST=...
 private List<Map> expandWeeklyMaster(Map master, Long windowStart, Long windowEnd, TimeZone calendarTz, Map<String, Map> overrides) {
     List<Map> out = []
     String rrule = (master.rrule as String)
@@ -687,7 +685,6 @@ private List<Map> expandWeeklyMaster(Map master, Long windowStart, Long windowEn
     Integer interval = safeInt(rr.INTERVAL, 1)
     if (interval < 1) interval = 1
 
-    // BYDAY list; if missing, default to DTSTART weekday
     List<String> byday = []
     if (rr.BYDAY) {
         byday = (rr.BYDAY as String).split(",").collect { it.trim().toUpperCase() }.findAll { it }
@@ -702,25 +699,21 @@ private List<Map> expandWeeklyMaster(Map master, Long windowStart, Long windowEn
         byday = [dowToByday(cStart.get(Calendar.DAY_OF_WEEK))]
     }
 
-    // Local time components from DTSTART
     Integer hh = cStart.get(Calendar.HOUR_OF_DAY)
     Integer mm = cStart.get(Calendar.MINUTE)
     Integer ss = cStart.get(Calendar.SECOND)
 
-    // UNTIL handling
     Long untilMs = null
     if (rr.UNTIL) {
         untilMs = parseUntilMs(rr.UNTIL as String, tzRec, calendarTz)
     }
 
-    // WKST (week start) for interval alignment
     Integer wkst = bydayToCalDow((rr.WKST ?: "SU").toString().trim().toUpperCase())
     if (!wkst) wkst = Calendar.SUNDAY
 
     Long masterStartMs = master.startMs as Long
     Long durationMs = (master.durationMs instanceof Long) ? (master.durationMs as Long) : ((master.endMs as Long) - (master.startMs as Long))
 
-    // Iterate day-by-day across the window in tzRec (inclusive bounds)
     Calendar day = Calendar.getInstance(tzRec)
     day.setTimeInMillis(windowStart)
     day.set(Calendar.HOUR_OF_DAY, 0)
@@ -755,7 +748,6 @@ private List<Map> expandWeeklyMaster(Map master, Long windowStart, Long windowEn
                     if (!untilMs || occStart <= untilMs) {
                         Long occEnd = occStart + durationMs
 
-                        // Apply override if present
                         String key = "${master.uid}@@${occStart}"
                         Map ov = overrides[key]
 
@@ -839,7 +831,6 @@ private String dowToByday(Integer calDow) {
     }
 }
 
-// Week start anchored at noon to reduce DST edge risk
 private Long weekStartMs(Calendar any, Integer wkstDow) {
     Calendar c = (Calendar) any.clone()
     while (c.get(Calendar.DAY_OF_WEEK) != wkstDow) {
