@@ -1,11 +1,11 @@
 {
   "author": "Chris Truitt",
-  "gitHubUrl": "https://github.com/truittgit/ical_hubitat",
+  "gitHubUrl": "https://github.com/truittgit/ical_hubitat_calendar_switch",
   "packages": [
     {
       "name": "iCal Calendar Switch",
       "category": "Integrations",
-      "location": "https://raw.githubusercontent.com/truittgit/ical_hubitat/main/packageManifest.json",
+      "location": "https://raw.githubusercontent.com/truittgit/ical_hubitat_calendar_switch/main/packageManifest.json",
       "description": "Calendar-driven virtual switch based on eligible iCal/ICS events, with hub timezone handling and Outlook/M365 timezone support."
     }
   ]
