@@ -8,6 +8,14 @@ This driver is designed to be reliable with real-world calendars, including Outl
 
 ---
 
+## Find this useful?  Tips are gladly accepted!
+
+Buy Me a Coffee: https://buymeacoffee.com/christruitt
+PayPal: https://www.paypal.com/paypalme/ctruit01/5
+Venmo: https://venmo.com/christruitt
+
+---
+
 ## What This Driver Is (and Is Not)
 
 This driver is:
@@ -167,9 +175,14 @@ Events missing:
 ## Author
 
 Chris Truitt  
-https://christophertruitt.com  
 GitHub: https://github.com/truittgit/ical_hubitat  
-Contact: contact@christophertruitt.com  
+Contact: hello@christruitt.com  
+
+Find this useful?  Tips are gladly accepted!
+
+Buy Me a Coffee: https://buymeacoffee.com/christruitt
+PayPal: https://www.paypal.com/paypalme/ctruit01/5
+Venmo: https://venmo.com/christruitt
 
 ---
 
