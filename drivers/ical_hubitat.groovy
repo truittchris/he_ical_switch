@@ -5,7 +5,7 @@
  *  GitHub:  https://github.com/truittgit/ical_hubitat_calendar_switch
  *  Contact: hello@christruitt.com
  *  Find this useful?  Tips are gladly accepted!
- *  https://www.christruitt.com/support
+ *  https://www.christruitt.com/tip-jar
  *
  *  Summary
  *   - Follows an iCal (ICS) URL and drives a Hubitat switch based on eligible events
