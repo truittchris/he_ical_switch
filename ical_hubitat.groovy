@@ -1,619 +1,703 @@
 /**
- * iCal (ICS) – Hubitat Driver
- * - Pulls an ICS URL, parses VEVENTs, exposes:
- *   - switch (on when "busy"/inMeeting)
- *   - inMeeting (bool)
- *   - currentSummary
- *   - nextSummary
- *   - nextEvents (multi-line list)
- *   - rawDebug (helpful parse + time window diagnostics)
+ *  iCal Calendar Switch (Hub TZ)
  *
- * Notes:
- * - "Include all-day events in next list" affects nextEvents/nextSummary display only.
- * - "All-day events count as busy" affects inMeeting/switch logic.
+ *  Author: Chris Truitt
+ *  Website: https://christophertruitt.com
+ *  GitHub:  https://github.com/truittgit/ical_hubitat
+ *  Contact: contact@christophertruitt.com
+ *
+ *  Summary
+ *   - Follows an iCal (ICS) URL and drives a Hubitat switch based on eligible events
+ *   - Uses the Hubitat hub timezone for display and scheduling (no timezone override required)
+ *   - Supports Outlook / Microsoft 365 calendar feeds via calendar-level timezone parsing:
+ *       X-WR-TIMEZONE and VTIMEZONE
+ *
+ *  Time handling
+ *   - DTSTART/DTEND supported forms:
+ *       1) UTC timestamps with "Z"
+ *       2) TZID=... parameters
+ *       3) Floating times (no TZID, no Z) interpreted using calendar timezone if present, else hub timezone
+ *   - Internally uses epoch milliseconds (absolute time); formatted output is always in hub timezone
+ *
+ *  License / Attribution
+ *   - Free for public use and redistribution, including modified versions
+ *   - Attribution must remain intact (author name, website, GitHub link, contact)
+ *
+ *  Disclaimer
+ *   - Provided "as is" without warranty. Use at your own risk.
  */
 
-import groovy.transform.Field
 import java.text.SimpleDateFormat
 
 metadata {
-    definition(name: "Dayforce iCal", namespace: "ctc", author: "ChatGPT") {
+    definition(name: "iCal Calendar Switch (Hub TZ)", namespace: "ctc", author: "Chris Truitt") {
         capability "Switch"
         capability "Refresh"
-        capability "Polling"
-
-        attribute "inMeeting", "bool"
-        attribute "currentSummary", "string"
-        attribute "nextSummary", "string"
-        attribute "nextEvents", "string"
-        attribute "rawDebug", "string"
-        attribute "charCount", "number"
-        attribute "lastFetch", "string"
 
         command "initialize"
         command "poll"
+        command "clearDebug"
+        command "showNext"
+
+        attribute "active", "bool"
+        attribute "activeSummary", "string"
+        attribute "nextSummary", "string"
+        attribute "nextEvents", "string"
+        attribute "lastFetch", "string"
+        attribute "lastStatus", "string"
+        attribute "rawDebug", "string"
+        attribute "calendarTz", "string"
     }
 }
 
 preferences {
-    input name: "enabled", type: "bool", title: "Enabled", defaultValue: true, required: true
+    input name: "icsUrl", type: "string", title: "ICS URL", required: true
 
-    input name: "icsUrl", type: "string", title: "iCal / ICS URL", required: true
+    input name: "pollSeconds", type: "number", title: "Poll interval (seconds)", defaultValue: 900
+    input name: "includePastHours", type: "number", title: "Include events started within past N hours", defaultValue: 6
+    input name: "horizonDays", type: "number", title: "Look ahead N days", defaultValue: 3
+    input name: "maxEvents", type: "number", title: "Max events to consider per poll", defaultValue: 80
 
-    input name: "updateFreq", type: "number", title: "Update frequency (seconds)",
-            defaultValue: 1800, required: true
+    input name: "triggerBusyOnly", type: "bool", title: "Trigger only for Busy events (TRANSP != TRANSPARENT)", defaultValue: true
+    input name: "excludeTentative", type: "bool", title: "Exclude tentative events (STATUS=TENTATIVE)", defaultValue: false
+    input name: "excludeDeclinedIfPresent", type: "bool", title: "Exclude declined events when PARTSTAT is present", defaultValue: false
+    input name: "triggerAllDay", type: "bool", title: "Trigger for all-day events", defaultValue: false
 
-    input name: "includePastHours", type: "number", title: "Include past hours",
-            defaultValue: 4, required: true
+    input name: "includeKeywords", type: "string", title: "Include keywords (comma-separated) – matches SUMMARY/LOCATION", required: false
+    input name: "excludeKeywords", type: "string", title: "Exclude keywords (comma-separated) – matches SUMMARY/LOCATION", required: false
 
-    input name: "horizonDays", type: "number", title: "Horizon days (how far ahead to consider events)",
-            defaultValue: 2, required: true
+    input name: "startOffsetMin", type: "number", title: "Start offset (minutes). Negative = earlier, positive = later", defaultValue: 0
+    input name: "endOffsetMin", type: "number", title: "End offset (minutes). Negative = earlier, positive = later", defaultValue: 0
 
-    input name: "maxEvt", type: "number", title: "Max events to parse (safety cap)",
-            defaultValue: 15, required: true
+    input name: "nextListCount", type: "number", title: "Next events list size (for debug)", defaultValue: 10
+    input name: "nextListShowLocation", type: "bool", title: "Include location in next events list", defaultValue: true
 
-    input name: "nextListCount", type: "number", title: "Next events list count",
-            defaultValue: 15, required: true
-
-    input name: "includeAllDayInNextList", type: "bool", title: "Include all-day events in next list",
-            defaultValue: false, required: true
-
-    input name: "allDayCountAsBusy", type: "bool", title: "All-day events count as busy",
-            defaultValue: false, required: true
-
-    input name: "showLocation", type: "bool", title: "Show location",
-            defaultValue: true, required: true
-
-    input name: "busyKeywords", type: "string", title: "Busy keywords (comma-separated)",
-            defaultValue: "Busy,Tentative,Away", required: false
-
-    input name: "freeKeywords", type: "string", title: "Free keywords (comma-separated)",
-            defaultValue: "Free", required: false
-
-    input name: "debugLogging", type: "bool", title: "Enable debug logging",
-            defaultValue: true, required: true
-
-    input name: "traceLogging", type: "bool", title: "Enable trace logging (very noisy)",
-            defaultValue: false, required: true
+    input name: "debugLogging", type: "bool", title: "Enable debug logging", defaultValue: true
+    input name: "debugMaxChars", type: "number", title: "Max debug buffer chars", defaultValue: 6000
 }
 
 def installed() {
+    sendEvent(name: "switch", value: "off")
+    sendEvent(name: "active", value: false)
     initialize()
 }
 
 def updated() {
-    unschedule()
     initialize()
 }
 
 def initialize() {
-    if (!enabled) {
-        logInfo("Initialize called but driver is disabled.")
-        setStateIdle("Disabled")
-        return
-    }
-    scheduleNextPoll()
-    poll()
+    unschedule()
+    state.lastPollMs = null
+    state.nextTransitionAtMs = null
+    state.calendarTzid = null
+
+    sendEvent(name: "lastStatus", value: "Initializing")
+    debugAdd("Initialize: pollSeconds=${safeInt(pollSeconds, 900)}, includePastHours=${safeInt(includePastHours, 6)}, horizonDays=${safeInt(horizonDays, 3)}, maxEvents=${safeInt(maxEvents, 80)}")
+    debugAdd("Filters: triggerBusyOnly=${!!triggerBusyOnly}, excludeTentative=${!!excludeTentative}, excludeDeclinedIfPresent=${!!excludeDeclinedIfPresent}, triggerAllDay=${!!triggerAllDay}")
+    debugAdd("Keywords: include='${includeKeywords ?: ""}', exclude='${excludeKeywords ?: ""}', offsets: start=${safeInt(startOffsetMin, 0)}m end=${safeInt(endOffsetMin, 0)}m")
+    debugAdd("Next list: count=${safeInt(nextListCount, 10)}, showLocation=${!!nextListShowLocation}")
+    debugAdd("Hub TZ: ${hubTz()?.getID()}")
+
+    runIn(2, "poll")
 }
 
-def refresh() {
-    poll()
-}
+def refresh() { poll() }
+def showNext() { poll() }
 
-def poll() {
-    if (!enabled) return
-    fetchAndProcess()
+def clearDebug() {
+    state.debugBuf = ""
+    sendEvent(name: "rawDebug", value: "")
 }
 
 def on() {
-    // Manual override is not meaningful here; treat as poll.
-    poll()
+    sendEvent(name: "switch", value: "on")
+    debugAdd("Switch manually turned ON.")
 }
 
 def off() {
-    // Manual override is not meaningful here; treat as poll.
-    poll()
+    sendEvent(name: "switch", value: "off")
+    debugAdd("Switch manually turned OFF.")
 }
 
-private void scheduleNextPoll() {
-    unschedule("scheduledPoll")
-    Long seconds = safeLong(updateFreq, 1800L)
-    if (seconds < 60L) seconds = 60L
+/* ---------------------------
+   Main poll logic
+---------------------------- */
 
-    // Use runIn so we can reliably reschedule after each run.
-    runIn((int)seconds, "scheduledPoll")
-    if (traceLogging) logTrace("Scheduled next poll in ${seconds}s")
-}
+def poll() {
+    if (!icsUrl?.trim()) {
+        sendEvent(name: "lastStatus", value: "Missing ICS URL")
+        debugAdd("Poll aborted: ICS URL is empty.")
+        scheduleNextPoll()
+        return
+    }
 
-def scheduledPoll() {
-    if (!enabled) return
-    fetchAndProcess()
+    Long nowMs = now()
+    Long lastPoll = (state.lastPollMs instanceof Long) ? state.lastPollMs : 0L
+    Integer minGapMs = Math.max(10, safeInt(pollSeconds, 900)) * 1000
+    if (lastPoll && (nowMs - lastPoll) < minGapMs) {
+        Long waitMs = minGapMs - (nowMs - lastPoll)
+        debugAdd("Poll throttled; next poll in ~${Math.round(waitMs / 1000)}s")
+        runIn(Math.max(2, Math.round(waitMs / 1000) as Integer), "poll")
+        return
+    }
+    state.lastPollMs = nowMs
+
+    sendEvent(name: "lastStatus", value: "Fetching")
+    debugAdd("Fetching ICS: ${icsUrl}")
+
+    String body = null
+    Integer statusCode = null
+
+    try {
+        httpGet([uri: icsUrl, timeout: 25]) { resp ->
+            statusCode = resp?.status
+            if (resp?.data != null) {
+                try {
+                    body = (resp.data instanceof String) ? (resp.data as String) : resp.data.getText("UTF-8")
+                } catch (e1) {
+                    body = resp.data?.toString()
+                }
+            }
+        }
+    } catch (e) {
+        sendEvent(name: "lastStatus", value: "Fetch exception")
+        debugAdd("Fetch exception: ${e}")
+        scheduleNextPoll()
+        return
+    }
+
+    sendEvent(name: "lastFetch", value: fmtStamp(new Date(), hubTz()))
+    debugAdd("Fetch status=${statusCode}, chars=${body ? body.length() : 0}")
+
+    if (!body || statusCode != 200) {
+        sendEvent(name: "lastStatus", value: "Fetch failed")
+        debugAdd("Fetch failed: status=${statusCode}, bodyPresent=${body != null}")
+        scheduleNextPoll()
+        return
+    }
+
+    if (!body.contains("BEGIN:VCALENDAR") || !body.contains("BEGIN:VEVENT")) {
+        sendEvent(name: "lastStatus", value: "Invalid ICS")
+        debugAdd("Invalid ICS: missing VCALENDAR/VEVENT. Head='${safeHead(body)}'")
+        scheduleNextPoll()
+        return
+    }
+
+    sendEvent(name: "lastStatus", value: "Parsing")
+
+    // Parse calendar timezone hint first (Outlook-safe)
+    TimeZone calTz = detectCalendarTimeZone(body)
+    state.calendarTzid = calTz?.getID()
+    sendEvent(name: "calendarTz", value: state.calendarTzid)
+    debugAdd("Calendar TZ detected: ${state.calendarTzid ?: "none"}")
+
+    List<Map> events = parseIcs(body, calTz)
+    debugAdd("Parsed VEVENT count=${events.size()}")
+
+    Long windowStart = nowMs - (safeInt(includePastHours, 6) * 3600000L)
+    Long windowEnd   = nowMs + (safeInt(horizonDays, 3) * 86400000L)
+
+    Long startOffsetMs = safeInt(startOffsetMin, 0) * 60000L
+    Long endOffsetMs   = safeInt(endOffsetMin, 0) * 60000L
+
+    List<Map> eligible = events.findAll { ev ->
+        Long s = (ev?.startMs as Long)
+        Long e = (ev?.endMs as Long)
+        if (!s || !e) return false
+
+        Long es = s + startOffsetMs
+        Long ee = e + endOffsetMs
+        if (ee < es) return false
+
+        (ee >= windowStart) && (es <= windowEnd)
+    }.collect { ev ->
+        ev.effStartMs = (ev.startMs as Long) + startOffsetMs
+        ev.effEndMs   = (ev.endMs as Long) + endOffsetMs
+        return ev
+    }.findAll { ev ->
+        isEligible(ev)
+    }.sort { a, b -> (a.effStartMs as Long) <=> (b.effStartMs as Long) }
+
+    Integer cap = safeInt(maxEvents, 80)
+    if (eligible.size() > cap) eligible = eligible.take(cap)
+
+    List<Map> activeNow = eligible.findAll { ev ->
+        (ev.effStartMs as Long) <= nowMs && nowMs < (ev.effEndMs as Long)
+    }
+
+    Map next = eligible.find { ev ->
+        (ev.effStartMs as Long) > nowMs
+    }
+
+    boolean isActiveNow = (activeNow && activeNow.size() > 0)
+    sendEvent(name: "active", value: isActiveNow)
+
+    Map governing = null
+    if (isActiveNow) {
+        governing = activeNow.sort { a, b -> (a.effEndMs as Long) <=> (b.effEndMs as Long) }[0]
+    }
+
+    sendEvent(name: "activeSummary", value: governing ? formatEventLine(governing, hubTz()) : null)
+    sendEvent(name: "nextSummary", value: next ? formatEventLine(next, hubTz()) : null)
+
+    // Next N list
+    Integer n = Math.max(0, safeInt(nextListCount, 10))
+    String nextEventsText = ""
+    if (n > 0) {
+        List<Map> upcoming = eligible.findAll { ev ->
+            (ev.effEndMs as Long) >= nowMs
+        }.take(n)
+
+        nextEventsText = upcoming.collect { ev ->
+            "• " + formatEventLineForList(ev, hubTz(), (nextListShowLocation == true))
+        }.join("\n")
+    }
+    sendEvent(name: "nextEvents", value: nextEventsText)
+
+    String desiredSwitch = isActiveNow ? "on" : "off"
+    String currentSwitch = device.currentValue("switch") as String
+    if (desiredSwitch != currentSwitch) {
+        sendEvent(name: "switch", value: desiredSwitch)
+        debugAdd("Switch set to ${desiredSwitch} (eligibleActive=${isActiveNow})")
+    }
+
+    scheduleNextTransition(activeNow, next, nowMs)
+
+    sendEvent(name: "lastStatus", value: "OK")
     scheduleNextPoll()
 }
 
-private void fetchAndProcess() {
-    try {
-        if (!icsUrl) {
-            logWarn("No ICS URL configured.")
-            setStateIdle("No ICS URL")
-            return
-        }
+/* ---------------------------
+   Calendar timezone detection
+---------------------------- */
 
-        def params = [
-            uri: icsUrl,
-            timeout: 20,
-            contentType: "text/calendar"
-        ]
+private TimeZone detectCalendarTimeZone(String icsText) {
+    TimeZone hub = hubTz()
+    if (!icsText) return hub
 
-        httpGet(params) { resp ->
-            String body = coerceBodyToString(resp)
-            if (body == null || body.trim().isEmpty()) {
-                logWarn("ICS fetch returned empty body.")
-                setStateIdle("Empty ICS")
-                return
+    // Unfold to make header parsing reliable
+    List<String> lines = unfoldLines(icsText)
+
+    // Look for X-WR-TIMEZONE:America/New_York
+    String xwr = lines.find { it?.startsWith("X-WR-TIMEZONE:") }
+    if (xwr) {
+        String tzid = xwr.substring("X-WR-TIMEZONE:".length()).trim()
+        tzid = tzid.replace("\"", "")
+        TimeZone tz = TimeZone.getTimeZone(tzid)
+        if (tz && tz.getID() != "GMT") return tz
+    }
+
+    // Some calendars use TZID: in VTIMEZONE blocks; extract first TZID seen there
+    Integer vtzIdx = lines.findIndexOf { it == "BEGIN:VTIMEZONE" }
+    if (vtzIdx >= 0) {
+        for (int i = vtzIdx; i < Math.min(lines.size(), vtzIdx + 80); i++) {
+            String line = lines[i]
+            if (line?.startsWith("TZID:")) {
+                String tzid = line.substring("TZID:".length()).trim().replace("\"", "")
+                TimeZone tz = TimeZone.getTimeZone(tzid)
+                if (tz && tz.getID() != "GMT") return tz
             }
-
-            sendEvent(name: "charCount", value: body.length())
-            sendEvent(name: "lastFetch", value: formatHubNow())
-
-            List<Map> events = parseIcs(body)
-            if (debugLogging) logDebug("Parsed events raw=${events.size()}")
-
-            processEvents(events)
+            if (line == "END:VTIMEZONE") break
         }
-    } catch (e) {
-        logWarn("Fetch exception: ${e?.toString()}")
-        sendEvent(name: "rawDebug", value: "Fetch exception: ${e?.toString()}")
-        setStateIdle("Fetch exception")
     }
+
+    return hub
 }
 
-private String coerceBodyToString(resp) {
-    try {
-        def d = resp?.data
-        if (d == null) return null
+/* ---------------------------
+   Eligibility logic
+---------------------------- */
 
-        // byte[]
-        if (d instanceof byte[]) {
-            return new String((byte[])d, "UTF-8")
-        }
+private boolean isEligible(Map ev) {
+    String status = (ev?.status ?: "") as String
+    if (status?.toUpperCase() == "CANCELLED") return false
 
-        // Some Hubitat responses expose 'text'
-        if (d?.metaClass?.hasProperty(d, "text")) {
-            return d.text?.toString()
-        }
+    if ((ev?.allDay == true) && !(triggerAllDay == true)) return false
 
-        // InputStream-like objects sometimes stringify OK, otherwise fall back to resp.getData()
-        def s = d.toString()
-        return s
-    } catch (ignored) {
-        try {
-            // As a last resort
-            return resp?.getData()?.toString()
-        } catch (ignored2) {
-            return null
-        }
-    }
-}
-
-private void processEvents(List<Map> rawEvents) {
-    Date nowDt = new Date()
-    TimeZone hubTz = location?.timeZone ?: TimeZone.getTimeZone("UTC")
-
-    Long pastMs = safeLong(includePastHours, 4L) * 60L * 60L * 1000L
-    Long horizonMs = safeLong(horizonDays, 2L) * 24L * 60L * 60L * 1000L
-
-    Date windowStart = new Date(nowDt.time - pastMs)
-    Date windowEnd = new Date(nowDt.time + horizonMs)
-
-    // Filter cancelled + outside window, then dedupe
-    List<Map> filtered = rawEvents
-        .findAll { Map ev ->
-            if (ev.cancelled) return false
-            if (!ev.start || !ev.end) return false
-            // Keep if overlaps window
-            return (ev.end.time > windowStart.time) && (ev.start.time < windowEnd.time)
-        }
-
-    filtered = dedupeEvents(filtered)
-
-    // Sort by start
-    filtered.sort { a, b -> a.start.time <=> b.start.time }
-
-    // Determine "current" and "next"
-    Map current = filtered.find { Map ev ->
-        isNowWithinEvent(nowDt, ev)
+    if (triggerBusyOnly == true) {
+        String transp = (ev?.transp ?: "") as String
+        if (transp?.toUpperCase() == "TRANSPARENT") return false
     }
 
-    // Determine busy state
-    boolean inMeet = false
-    if (current) {
-        inMeet = eventCountsAsBusy(current)
-    } else {
-        // Some users want "busy if next is soon" – not enabled here.
-        inMeet = false
+    if (excludeTentative == true) {
+        if (status?.toUpperCase() == "TENTATIVE") return false
     }
 
-    // Build upcoming list (from now forward, plus current if it’s not all-day excluded)
-    List<Map> upcoming = filtered.findAll { Map ev ->
-        // Include current and future events for list
-        return ev.end.time >= nowDt.time
+    if (excludeDeclinedIfPresent == true) {
+        List<String> partstats = (ev?.partstats instanceof List) ? (ev.partstats as List<String>) : []
+        boolean hasDeclined = partstats.any { ps -> (ps ?: "").toUpperCase() == "DECLINED" }
+        if (hasDeclined) return false
     }
 
-    // Apply display rules for all-day events
-    if (!includeAllDayInNextList) {
-        upcoming = upcoming.findAll { !it.allDay }
+    List<String> includes = parseKeywords(includeKeywords)
+    List<String> excludes = parseKeywords(excludeKeywords)
+
+    String hay = ((ev?.summary ?: "") + " " + (ev?.location ?: "")).toString().toLowerCase()
+
+    if (includes && includes.size() > 0) {
+        boolean anyMatch = includes.any { kw -> hay.contains(kw) }
+        if (!anyMatch) return false
     }
 
-    // Limit list count
-    int listMax = (int)Math.max(1, safeLong(nextListCount, 15L))
-    if (upcoming.size() > listMax) upcoming = upcoming.take(listMax)
-
-    // Choose next event for nextSummary (first item in upcoming list)
-    Map next = upcoming ? upcoming[0] : null
-
-    // Attributes
-    sendEvent(name: "inMeeting", value: inMeet)
-
-    if (inMeet) {
-        sendEvent(name: "switch", value: "on")
-    } else {
-        sendEvent(name: "switch", value: "off")
+    if (excludes && excludes.size() > 0) {
+        boolean anyExclude = excludes.any { kw -> hay.contains(kw) }
+        if (anyExclude) return false
     }
 
-    sendEvent(name: "currentSummary", value: current ? formatEventSummary(current) : null)
-    sendEvent(name: "nextSummary", value: next ? formatEventSummary(next) : null)
-    sendEvent(name: "nextEvents", value: formatNextEventsList(upcoming))
-
-    // Raw debug text to validate dates/times quickly
-    String dbg = buildDebug(nowDt, hubTz, windowStart, windowEnd, current, next, filtered, upcoming)
-    sendEvent(name: "rawDebug", value: dbg)
-
-    if (traceLogging) {
-        logTrace("Now busy=${inMeet}; current=${current?.summary}; next=${next?.summary}; upcoming=${upcoming.size()}")
-    }
-}
-
-private boolean isNowWithinEvent(Date nowDt, Map ev) {
-    if (!ev?.start || !ev?.end) return false
-    // All-day events: DTSTART (date) to DTEND (date, exclusive). This still works with Date times at midnight.
-    return (nowDt.time >= ev.start.time) && (nowDt.time < ev.end.time)
-}
-
-private boolean eventCountsAsBusy(Map ev) {
-    // All-day handling
-    if (ev.allDay && !allDayCountAsBusy) return false
-
-    // Transparency / status logic
-    if (ev.transparent) return false
-
-    // Keyword-based busy/free (uses event "busyState" if we infer it)
-    if (ev.freeByKeyword) return false
-    if (ev.busyByKeyword) return true
-
-    // Default: timed events count as busy
     return true
 }
 
-private List<Map> dedupeEvents(List<Map> events) {
-    Map<String, Map> seen = [:]
-    events.each { Map ev ->
-        String uid = ev.uid ?: ""
-        String key = uid ? "${uid}|${ev.start?.time}" : "${ev.summary ?: ''}|${ev.start?.time}"
-        // Keep earliest end if duplicates clash
-        if (!seen.containsKey(key)) {
-            seen[key] = ev
-        } else {
-            Map existing = seen[key]
-            if (existing?.end && ev?.end && ev.end.time > existing.end.time) {
-                seen[key] = ev
-            }
-        }
-    }
-    return seen.values().toList()
+private List<String> parseKeywords(String s) {
+    if (!s) return []
+    return (s.split(",") as List<String>)
+        .collect { it?.trim()?.toLowerCase() }
+        .findAll { it }
 }
 
-private String formatNextEventsList(List<Map> upcoming) {
-    if (!upcoming || upcoming.isEmpty()) return "None"
-    StringBuilder sb = new StringBuilder()
-    int i = 1
-    upcoming.each { Map ev ->
-        sb.append("${i}. ").append(formatEventSummary(ev)).append("\n")
-        i++
-    }
-    return sb.toString().trim()
-}
+/* ---------------------------
+   Transition scheduling
+---------------------------- */
 
-private String formatEventSummary(Map ev) {
-    if (!ev?.start || !ev?.end) return ev?.summary ?: "Event"
+private void scheduleNextTransition(List<Map> activeNow, Map next, Long nowMs) {
+    Long targetMs = null
+    String why = null
 
-    if (ev.allDay) {
-        return "${formatDateOnly(ev.start)} (All-day) ${safeStr(ev.summary)}${formatLocation(ev)}"
+    if (activeNow && activeNow.size() > 0) {
+        Map soonestEnd = activeNow.sort { a, b -> (a.effEndMs as Long) <=> (b.effEndMs as Long) }[0]
+        targetMs = soonestEnd.effEndMs as Long
+        why = "active-end"
+    } else if (next) {
+        targetMs = next.effStartMs as Long
+        why = "next-start"
     }
 
-    return "${formatDateTime(ev.start)} – ${formatTimeOnly(ev.end)} ${safeStr(ev.summary)}${formatLocation(ev)}"
+    if (!targetMs) {
+        state.nextTransitionAtMs = null
+        debugAdd("No upcoming transition found.")
+        return
+    }
+
+    Long deltaMs = targetMs - nowMs
+    Integer seconds = (deltaMs <= 0) ? 2 : Math.max(2, Math.round(deltaMs / 1000.0) as Integer)
+
+    Long last = (state.nextTransitionAtMs instanceof Long) ? (state.nextTransitionAtMs as Long) : null
+    if (last && Math.abs(last - targetMs) < 1500) {
+        debugAdd("Transition unchanged (${why}) at ${fmtStamp(new Date(targetMs), hubTz())}")
+        return
+    }
+
+    state.nextTransitionAtMs = targetMs
+    runIn(seconds, "poll")
+    debugAdd("Scheduled transition (${why}) in ${seconds}s at ${fmtStamp(new Date(targetMs), hubTz())}")
 }
 
-private String formatLocation(Map ev) {
-    if (!showLocation) return ""
-    String loc = (ev.location ?: "").trim()
-    return loc ? " @ ${loc}" : ""
+private void scheduleNextPoll() {
+    Integer s = Math.max(30, safeInt(pollSeconds, 900))
+    runIn(s, "poll")
+    debugAdd("Scheduled regular poll in ${s}s")
 }
 
-private String formatDateTime(Date dt) {
-    def tz = location?.timeZone ?: TimeZone.getTimeZone("UTC")
-    SimpleDateFormat sdf = new SimpleDateFormat("EEE MMM d, yyyy h:mm a z")
-    sdf.setTimeZone(tz)
-    return sdf.format(dt)
-}
+/* ---------------------------
+   ICS parsing
+---------------------------- */
 
-private String formatTimeOnly(Date dt) {
-    def tz = location?.timeZone ?: TimeZone.getTimeZone("UTC")
-    SimpleDateFormat sdf = new SimpleDateFormat("h:mm a z")
-    sdf.setTimeZone(tz)
-    return sdf.format(dt)
-}
-
-private String formatDateOnly(Date dt) {
-    def tz = location?.timeZone ?: TimeZone.getTimeZone("UTC")
-    SimpleDateFormat sdf = new SimpleDateFormat("EEE MMM d, yyyy")
-    sdf.setTimeZone(tz)
-    return sdf.format(dt)
-}
-
-private String formatHubNow() {
-    return formatDateTime(new Date())
-}
-
-private String buildDebug(Date nowDt, TimeZone hubTz, Date windowStart, Date windowEnd,
-                          Map current, Map next, List<Map> filtered, List<Map> upcoming) {
-    StringBuilder sb = new StringBuilder()
-    sb.append("hubTz=${hubTz?.ID} hubNow=${formatDateTime(nowDt)}\n")
-    sb.append("windowStart=${formatDateTime(windowStart)}\n")
-    sb.append("windowEnd=${formatDateTime(windowEnd)}\n")
-    sb.append("parsedInWindow=${filtered.size()} upcomingShown=${upcoming.size()}\n")
-    sb.append("CURRENT: ").append(current ? rawEventLine(current) : "none").append("\n")
-    sb.append("NEXT[1]: ").append(next ? rawEventLine(next) : "none")
-    return sb.toString().trim()
-}
-
-private String rawEventLine(Map ev) {
-    String tzid = ev.tzid ?: ""
-    String st = ev.allDay ? formatDateOnly(ev.start) : formatDateTime(ev.start)
-    String en = ev.allDay ? formatDateOnly(ev.end) : formatDateTime(ev.end)
-    return "TZID=${tzid} DTSTART=${st} DTEND=${en} SUMMARY=${safeStr(ev.summary)}"
-}
-
-private List<Map> parseIcs(String icsText) {
-    // Unfold lines (RFC5545): lines that begin with space or tab continue previous line
+private List<Map> parseIcs(String icsText, TimeZone calendarTz) {
     List<String> lines = unfoldLines(icsText)
 
     List<Map> events = []
-    Map current = null
-    boolean inEvent = false
+    Map cur = null
 
     lines.each { String line ->
         if (line == "BEGIN:VEVENT") {
-            inEvent = true
-            current = [:]
-            current.cancelled = false
-            current.transparent = false
-            current.allDay = false
-            current.uid = null
-            current.summary = null
-            current.location = null
-            current.tzid = null
-            current.freeByKeyword = false
-            current.busyByKeyword = false
-            current.dtstartMeta = [:]
-            current.dtendMeta = [:]
+            cur = [props: [:], attendees: []]
             return
         }
-
         if (line == "END:VEVENT") {
-            if (current) {
-                // Must have DTSTART; DTEND can be derived for some all-day events
-                if (current.start && current.end) {
-                    inferBusyFreeKeywords(current)
-                    events << current
-                }
+            if (cur) {
+                Map ev = buildEvent(cur, calendarTz)
+                if (ev) events << ev
             }
-            inEvent = false
-            current = null
+            cur = null
             return
         }
+        if (!cur) return
 
-        if (!inEvent || current == null) return
-
-        // Key:params:value parsing
-        int idx = line.indexOf(":")
+        Integer idx = line.indexOf(":")
         if (idx <= 0) return
 
         String left = line.substring(0, idx)
         String value = line.substring(idx + 1)
 
-        String key
+        String name = left
         Map params = [:]
 
         if (left.contains(";")) {
-            def parts = left.split(";")
-            key = parts[0].trim().toUpperCase()
+            List<String> parts = left.split(";") as List<String>
+            name = parts[0]
             parts.drop(1).each { p ->
-                def kv = p.split("=", 2)
-                if (kv.size() == 2) params[kv[0].trim().toUpperCase()] = kv[1].trim()
-                else params[p.trim().toUpperCase()] = true
+                Integer eIdx = p.indexOf("=")
+                if (eIdx > 0) {
+                    String k = p.substring(0, eIdx)
+                    String v = p.substring(eIdx + 1)
+                    params[k] = v
+                } else {
+                    params[p] = true
+                }
             }
+        }
+
+        if (name == "ATTENDEE") {
+            cur.attendees << [value: value, params: params]
         } else {
-            key = left.trim().toUpperCase()
+            cur.props[name] = [value: value, params: params]
         }
-
-        switch (key) {
-            case "UID":
-                current.uid = value?.trim()
-                break
-            case "SUMMARY":
-                current.summary = value?.trim()
-                break
-            case "LOCATION":
-                current.location = value?.trim()
-                break
-            case "STATUS":
-                if (value?.trim()?.toUpperCase() == "CANCELLED") current.cancelled = true
-                break
-            case "TRANSP":
-                if (value?.trim()?.toUpperCase() == "TRANSPARENT") current.transparent = true
-                break
-            case "DTSTART":
-                current.dtstartMeta = params
-                applyDt(current, true, value, params)
-                break
-            case "DTEND":
-                current.dtendMeta = params
-                applyDt(current, false, value, params)
-                break
-            default:
-                break
-        }
-    }
-
-    // Safety cap
-    int cap = (int)Math.max(1, safeLong(maxEvt, 15L))
-    if (events.size() > cap * 50) {
-        // if someone’s feed is huge, keep the most recent slice
-        events.sort { a, b -> a.start.time <=> b.start.time }
-        events = events.takeRight(cap * 50)
     }
 
     return events
 }
 
-private void applyDt(Map ev, boolean isStart, String value, Map params) {
-    if (!value) return
+private Map buildEvent(Map raw, TimeZone calendarTz) {
+    Map p = raw?.props ?: [:]
 
-    String tzid = params?.get("TZID")
-    if (tzid) ev.tzid = tzid
+    Map ds = p.DTSTART
+    Map de = p.DTEND
+    if (!ds?.value) return null
 
-    boolean isDateOnly = false
-    if ((params?.get("VALUE") ?: "").toString().toUpperCase() == "DATE") {
-        isDateOnly = true
-    } else if (value ==~ /^\d{8}$/) {
-        isDateOnly = true
-    }
+    String status = ((p.STATUS?.value ?: "") as String).trim()
+    String transp = ((p.TRANSP?.value ?: "") as String).trim()
 
-    Date parsed = parseIcsDate(value.trim(), tzid, isDateOnly)
-    if (!parsed) return
+    TimeZone tzStart = tzFromParams(ds?.params)
+    TimeZone tzEnd   = tzFromParams(de?.params)
 
-    if (isDateOnly) {
-        ev.allDay = true
-    }
+    Date start = parseICalDate(ds.value as String, tzStart, calendarTz)
+    Date end
 
-    if (isStart) {
-        ev.start = parsed
+    if (de?.value) {
+        end = parseICalDate(de.value as String, tzEnd ?: tzStart, calendarTz)
     } else {
-        ev.end = parsed
+        if (isAllDayValue(ds.value as String)) end = new Date(start.time + 86400000L)
+        else end = new Date(start.time + 1800000L)
     }
 
-    // If it's an all-day event and only DTSTART exists, some feeds omit DTEND.
-    // If DTEND is missing, set end = start + 1 day (exclusive).
-    if (ev.allDay && ev.start && !ev.end) {
-        ev.end = new Date(ev.start.time + 24L * 60L * 60L * 1000L)
+    if (!start || !end) return null
+    if (end.time < start.time) return null
+
+    String summary = unescapeIcsText((p.SUMMARY?.value ?: "") as String)
+    String location = unescapeIcsText((p.LOCATION?.value ?: "") as String)
+    String uid = (p.UID?.value ?: "") as String
+
+    List<String> partstats = []
+    List<Map> attendees = (raw?.attendees instanceof List) ? (raw.attendees as List<Map>) : []
+    attendees.each { at ->
+        Map prm = at?.params ?: [:]
+        String ps = prm?.PARTSTAT
+        if (ps) partstats << ps
     }
+
+    return [
+        uid      : uid,
+        summary  : summary,
+        location : location,
+        status   : status,
+        transp   : transp,
+        partstats: partstats,
+        startMs  : start.time,
+        endMs    : end.time,
+        allDay   : isAllDayValue(ds.value as String)
+    ]
 }
 
-private Date parseIcsDate(String raw, String tzid, boolean dateOnly) {
+private TimeZone tzFromParams(Map params) {
+    if (!params) return null
+    String tzid = params.TZID
+    if (!tzid) return null
+    tzid = tzid.replace("\"", "")
+    TimeZone tz = TimeZone.getTimeZone(tzid)
+    // If unknown, Java returns GMT; treat that as null so we can fall back.
+    if (tz?.getID() == "GMT" && tzid != "GMT") return null
+    return tz
+}
+
+/**
+ * Parse iCal date/time:
+ *  - If endsWith Z -> UTC absolute time
+ *  - If no T -> all-day date in tzContext/calendarTz/hubTz
+ *  - If floating (no Z, no TZID) -> interpret in calendarTz if present, else hubTz
+ */
+private Date parseICalDate(String rawVal, TimeZone tzContext, TimeZone calendarTz) {
+    if (!rawVal) return null
+
+    String v = rawVal.trim()
+    TimeZone hub = hubTz()
+
+    if (v.endsWith("Z") && v.contains("T")) {
+        Date d = tryParse(v, "yyyyMMdd'T'HHmmss'Z'", TimeZone.getTimeZone("UTC"))
+        if (d) return d
+        d = tryParse(v, "yyyyMMdd'T'HHmm'Z'", TimeZone.getTimeZone("UTC"))
+        if (d) return d
+        return null
+    }
+
+    if (!v.contains("T")) {
+        TimeZone tz = tzContext ?: (calendarTz ?: hub)
+        return tryParse(v, "yyyyMMdd", tz)
+    }
+
+    // Floating/local datetime
+    TimeZone tz = tzContext ?: (calendarTz ?: hub)
+    Date d = tryParse(v, "yyyyMMdd'T'HHmmss", tz)
+    if (d) return d
+    d = tryParse(v, "yyyyMMdd'T'HHmm", tz)
+    if (d) return d
+
+    return null
+}
+
+private Date tryParse(String v, String pattern, TimeZone tz) {
     try {
-        TimeZone tz = tzid ? TimeZone.getTimeZone(tzid) : (location?.timeZone ?: TimeZone.getTimeZone("UTC"))
-
-        if (dateOnly) {
-            // DTSTART;VALUE=DATE:YYYYMMDD
-            SimpleDateFormat sdf = new SimpleDateFormat("yyyyMMdd")
-            sdf.setTimeZone(tz)
-            return sdf.parse(raw)
-        }
-
-        // Date-time forms:
-        // YYYYMMDDTHHMMSSZ
-        // YYYYMMDDTHHMMSS
-        // YYYYMMDDTHHMMZ
-        // YYYYMMDDTHHMM
-        boolean utc = raw.endsWith("Z")
-        String val = utc ? raw.substring(0, raw.length() - 1) : raw
-
-        String pattern
-        if (val.size() == 15) pattern = "yyyyMMdd'T'HHmmss"
-        else if (val.size() == 13) pattern = "yyyyMMdd'T'HHmm"
-        else return null
-
         SimpleDateFormat sdf = new SimpleDateFormat(pattern)
-        sdf.setTimeZone(utc ? TimeZone.getTimeZone("UTC") : tz)
-        Date dt = sdf.parse(val)
-
-        // Convert from UTC to hub timezone if UTC input
-        if (utc) return dt
-        return dt
+        sdf.setLenient(false)
+        sdf.setTimeZone(tz)
+        return sdf.parse(v)
     } catch (e) {
-        if (debugLogging) logDebug("Failed to parse date raw=${raw} tzid=${tzid} dateOnly=${dateOnly} err=${e}")
         return null
     }
 }
 
-private List<String> unfoldLines(String text) {
-    List<String> rawLines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n") as List
-    List<String> out = []
-    String current = null
+private boolean isAllDayValue(String rawVal) {
+    if (!rawVal) return false
+    String v = rawVal.trim()
+    (!v.contains("T")) && (v.length() == 8)
+}
 
-    rawLines.each { String ln ->
-        if (ln == null) return
-        if (ln.startsWith(" ") || ln.startsWith("\t")) {
-            if (current != null) current = current + ln.substring(1)
+// Unfold iCal lines: lines beginning with space/tab continue previous line.
+private List<String> unfoldLines(String text) {
+    List<String> raw = text.replace("\r\n", "\n").split("\n") as List<String>
+    List<String> out = []
+    String cur = null
+
+    raw.each { String line ->
+        if (line == null) return
+        if (line.startsWith(" ") || line.startsWith("\t")) {
+            if (cur != null) cur = cur + line.substring(1)
         } else {
-            if (current != null) out << current
-            current = ln.trim()
+            if (cur != null) out << cur
+            cur = line.trim()
         }
     }
-    if (current != null) out << current
+    if (cur != null) out << cur
     return out
 }
 
-private void inferBusyFreeKeywords(Map ev) {
-    String sum = (ev.summary ?: "").toLowerCase()
-
-    List<String> busy = splitKeywords(busyKeywords)
-    List<String> free = splitKeywords(freeKeywords)
-
-    ev.busyByKeyword = busy.any { kw -> kw && sum.contains(kw.toLowerCase()) }
-    ev.freeByKeyword = free.any { kw -> kw && sum.contains(kw.toLowerCase()) }
+// iCal text escaping: \n, \, \;, \,
+private String unescapeIcsText(String s) {
+    if (s == null) return ""
+    String out = s
+    out = out.replace("\\n", "\n")
+    out = out.replace("\\N", "\n")
+    out = out.replace("\\\\", "\\")
+    out = out.replace("\\,", ",")
+    out = out.replace("\\;", ";")
+    return out
 }
 
-private List<String> splitKeywords(String csv) {
-    if (!csv) return []
-    return csv.split(",").collect { it.trim() }.findAll { it }
+/* ---------------------------
+   Formatting + utils
+---------------------------- */
+
+private TimeZone hubTz() {
+    return location?.timeZone ?: TimeZone.getDefault()
 }
 
-private Long safeLong(def v, Long dflt) {
+private String formatEventLine(Map ev, TimeZone tz) {
+    Date s = new Date((ev.effStartMs ? (ev.effStartMs as Long) : (ev.startMs as Long)))
+    Date e = new Date((ev.effEndMs ? (ev.effEndMs as Long) : (ev.endMs as Long)))
+
+    if (ev.allDay) {
+        String day = fmtDate(s, tz, "EEE MMM d, yyyy")
+        return "${day} (All-day) ${ev.summary}${ev.location ? " @ ${ev.location}" : ""}"
+    }
+
+    String startStr = fmtDate(s, tz, "EEE MMM d h:mm a")
+    String sd = fmtDate(s, tz, "yyyyMMdd")
+    String ed = fmtDate(e, tz, "yyyyMMdd")
+    String endStr = (sd == ed) ? fmtDate(e, tz, "h:mm a") : fmtDate(e, tz, "EEE MMM d h:mm a")
+
+    String base = "${startStr} – ${endStr} ${ev.summary}"
+    if (ev.location) base = base + " @ ${ev.location}"
+    return base
+}
+
+private String formatEventLineForList(Map ev, TimeZone tz, boolean includeLoc) {
+    Date s = new Date((ev.effStartMs ? (ev.effStartMs as Long) : (ev.startMs as Long)))
+    Date e = new Date((ev.effEndMs ? (ev.effEndMs as Long) : (ev.endMs as Long)))
+
+    String summary = (ev.summary ?: "").toString()
+    String loc = (ev.location ?: "").toString()
+
+    if (ev.allDay) {
+        String day = fmtDate(s, tz, "EEE MMM d, yyyy")
+        String line = "${day} (All-day) ${summary}"
+        if (includeLoc && loc) line = line + " @ ${loc}"
+        return line
+    }
+
+    String startStr = fmtDate(s, tz, "EEE MMM d h:mm a")
+    String sd = fmtDate(s, tz, "yyyyMMdd")
+    String ed = fmtDate(e, tz, "yyyyMMdd")
+    String endStr = (sd == ed) ? fmtDate(e, tz, "h:mm a") : fmtDate(e, tz, "EEE MMM d h:mm a")
+
+    String line = "${startStr} – ${endStr} ${summary}"
+    if (includeLoc && loc) line = line + " @ ${loc}"
+    return line
+}
+
+private String fmtDate(Date d, TimeZone tz, String pattern) {
+    SimpleDateFormat sdf = new SimpleDateFormat(pattern)
+    sdf.setTimeZone(tz)
+    return sdf.format(d)
+}
+
+private String fmtStamp(Date d, TimeZone tz) {
+    return fmtDate(d, tz, "EEE MMM d, yyyy h:mm:ss a z")
+}
+
+private Integer safeInt(def v, Integer defVal) {
     try {
-        if (v == null) return dflt
-        if (v instanceof Number) return ((Number)v).longValue()
-        return Long.parseLong(v.toString().trim())
-    } catch (ignored) {
-        return dflt
+        if (v == null) return defVal
+        if (v instanceof Number) return (v as Number).intValue()
+        String s = v.toString().trim()
+        if (!s) return defVal
+        return Integer.parseInt(s)
+    } catch (e) {
+        return defVal
     }
 }
 
-private String safeStr(String s) {
-    return (s == null) ? "" : s
+private String safeHead(String s) {
+    if (!s) return ""
+    Integer n = Math.min(80, s.length())
+    return s.substring(0, n).replace("\n", "\\n").replace("\r", "\\r")
 }
 
-private void setStateIdle(String reason) {
-    sendEvent(name: "inMeeting", value: false)
-    sendEvent(name: "switch", value: "off")
-    sendEvent(name: "currentSummary", value: null)
-    sendEvent(name: "nextSummary", value: null)
-    sendEvent(name: "nextEvents", value: "None")
-    if (reason) sendEvent(name: "rawDebug", value: reason)
-}
+private void debugAdd(String msg) {
+    if (!(debugLogging == true)) return
 
-private void logDebug(String msg) { if (debugLogging) log.debug "${device.displayName}: ${msg}" }
-private void logInfo(String msg) { log.info "${device.displayName}: ${msg}" }
-private void logWarn(String msg) { log.warn "${device.displayName}: ${msg}" }
-private void logTrace(String msg) { if (traceLogging) log.trace "${device.displayName}: ${msg}" }
+    String stamp = fmtDate(new Date(), hubTz(), "MM-dd HH:mm:ss")
+    String line = "${stamp} ${msg}"
+    log.debug(line)
+
+    String buf = (state.debugBuf instanceof String) ? (state.debugBuf as String) : ""
+    buf = buf ? (buf + "\n" + line) : line
+
+    Integer cap = safeInt(debugMaxChars, 6000)
+    if (buf.length() > cap) {
+        buf = buf.substring(buf.length() - cap)
+        Integer nl = buf.indexOf("\n")
+        if (nl > 0 && nl < 200) buf = buf.substring(nl + 1)
+    }
+
+    state.debugBuf = buf
+    sendEvent(name: "rawDebug", value: buf)
+}
