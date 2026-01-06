@@ -1,10 +1,11 @@
 /**
- *  iCal Calendar Switch (Hub TZ)
+ *  iCal Hubitat Calendar Switch
  *
  *  Author: Chris Truitt
- *  Website: https://christophertruitt.com
- *  GitHub:  https://github.com/truittgit/ical_hubitat
- *  Contact: contact@christophertruitt.com
+ *  GitHub:  https://github.com/truittgit/ical_hubitat_calendar_switch
+ *  Contact: hello@christruitt.com
+ *  Find this useful?  Tips are gladly accepted!
+ *  https://www.christruitt.com/support
  *
  *  Summary
  *   - Follows an iCal (ICS) URL and drives a Hubitat switch based on eligible events
@@ -38,7 +39,7 @@ import java.text.SimpleDateFormat
 import java.util.Calendar
 
 metadata {
-    definition(name: "iCal Calendar Switch (Hub TZ)", namespace: "ctc", author: "Chris Truitt") {
+    definition(name: "iCal Calendar Switch", namespace: "ctc", author: "Chris Truitt") {
         capability "Switch"
         capability "Refresh"
 

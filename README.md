@@ -10,9 +10,7 @@ This driver is designed to be reliable with real-world calendars, including Outl
 
 ## Find this useful?  Tips are gladly accepted!
 
-Buy Me a Coffee: https://buymeacoffee.com/christruitt
-PayPal: https://www.paypal.com/paypalme/ctruit01/5
-Venmo: https://venmo.com/christruitt
+https://www.christruitt.com/support
 
 ---
 
@@ -32,7 +30,7 @@ This driver is not:
 
 ## Key Features
 
-- Works with any public iCal / ICS URL
+- Works with any public iCal / ICS URL - DOES NOT REQUIRE a Google developer account
 - Correct timezone handling using the hub’s timezone
 - Outlook / Microsoft 365 compatible
 - Handles:
