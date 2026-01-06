@@ -1,0 +1,18 @@
+{
+  "packageName": "iCal Calendar Switch",
+  "author": "Chris Truitt",
+  "version": "1.0.2",
+  "minimumHEVersion": "2.3.0",
+  "licenseFile": "https://raw.githubusercontent.com/truittgit/ical_hubitat/main/LICENSE",
+  "documentationLink": "https://raw.githubusercontent.com/truittgit/ical_hubitat/main/README.md",
+  "releaseNotes": "Rename driver display name to iCal Calendar Switch. No functional changes.",
+  "drivers": [
+    {
+      "id": "ctc-ical-calendar-switch",
+      "name": "iCal Calendar Switch",
+      "namespace": "ctc",
+      "location": "https://raw.githubusercontent.com/truittgit/ical_hubitat/main/ical_hubitat.groovy",
+      "required": true
+    }
+  ]
+}
