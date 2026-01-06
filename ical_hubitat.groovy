@@ -11,6 +11,8 @@
  *   - Uses the Hubitat hub timezone for display and scheduling (no timezone override required)
  *   - Supports Outlook / Microsoft 365 calendar feeds via calendar-level timezone parsing:
  *       X-WR-TIMEZONE and VTIMEZONE
+ *   - Expands common Outlook/M365 weekly RRULEs (BYDAY, INTERVAL, UNTIL, WKST) into concrete instances
+ *     within the poll window (windowStart–windowEnd), and applies RECURRENCE-ID overrides.
  *
  *  Time handling
  *   - DTSTART/DTEND supported forms:
@@ -28,6 +30,7 @@
  */
 
 import java.text.SimpleDateFormat
+import java.util.Calendar
 
 metadata {
     definition(name: "iCal Calendar Switch (Hub TZ)", namespace: "ctc", author: "Chris Truitt") {
@@ -197,6 +200,11 @@ def poll() {
 
     Long windowStart = nowMs - (safeInt(includePastHours, 6) * 3600000L)
     Long windowEnd   = nowMs + (safeInt(horizonDays, 3) * 86400000L)
+
+    // Expand common weekly RRULE masters into concrete instances inside the window.
+    // Apply RECURRENCE-ID overrides (and drop CANCELLED overrides).
+    events = expandRecurringEvents(events, windowStart, windowEnd, calTz)
+    debugAdd("After RRULE expansion: event instances=${events.size()}")
 
     Long startOffsetMs = safeInt(startOffsetMin, 0) * 60000L
     Long endOffsetMs   = safeInt(endOffsetMin, 0) * 60000L
@@ -471,8 +479,12 @@ private Map buildEvent(Map raw, TimeZone calendarTz) {
     TimeZone tzEnd   = tzFromParams(de?.params)
 
     Date start = parseICalDate(ds.value as String, tzStart, calendarTz)
-    Date end
+    if (!start) {
+        debugAdd("Dropped VEVENT: unparseable DTSTART='${ds?.value}' TZID='${ds?.params?.TZID}' uid='${p.UID?.value ?: ""}' summary='${p.SUMMARY?.value ?: ""}'")
+        return null
+    }
 
+    Date end
     if (de?.value) {
         end = parseICalDate(de.value as String, tzEnd ?: tzStart, calendarTz)
     } else {
@@ -487,6 +499,19 @@ private Map buildEvent(Map raw, TimeZone calendarTz) {
     String location = unescapeIcsText((p.LOCATION?.value ?: "") as String)
     String uid = (p.UID?.value ?: "") as String
 
+    // RRULE (recurrence master)
+    String rrule = ((p.RRULE?.value ?: "") as String).trim()
+    if (!rrule) rrule = null
+
+    // RECURRENCE-ID (override instance)
+    Long recurrenceIdMs = null
+    if (p["RECURRENCE-ID"]?.value) {
+        Map rid = p["RECURRENCE-ID"]
+        TimeZone tzRid = tzFromParams(rid?.params) ?: tzStart
+        Date ridDate = parseICalDate(rid.value as String, tzRid, calendarTz)
+        if (ridDate) recurrenceIdMs = ridDate.time
+    }
+
     List<String> partstats = []
     List<Map> attendees = (raw?.attendees instanceof List) ? (raw.attendees as List<Map>) : []
     attendees.each { at ->
@@ -495,16 +520,25 @@ private Map buildEvent(Map raw, TimeZone calendarTz) {
         if (ps) partstats << ps
     }
 
+    Long durationMs = end.time - start.time
+    TimeZone tzRec = tzStart ?: (calendarTz ?: hubTz())
+
     return [
-        uid      : uid,
-        summary  : summary,
-        location : location,
-        status   : status,
-        transp   : transp,
-        partstats: partstats,
-        startMs  : start.time,
-        endMs    : end.time,
-        allDay   : isAllDayValue(ds.value as String)
+        uid           : uid,
+        summary       : summary,
+        location      : location,
+        status        : status,
+        transp        : transp,
+        partstats     : partstats,
+        startMs       : start.time,
+        endMs         : end.time,
+        durationMs    : durationMs,
+        allDay        : isAllDayValue(ds.value as String),
+
+        // recurrence support
+        rrule         : rrule,
+        recurrenceIdMs: recurrenceIdMs,
+        recTzId       : tzRec?.getID()
     ]
 }
 
@@ -600,6 +634,233 @@ private String unescapeIcsText(String s) {
     out = out.replace("\\,", ",")
     out = out.replace("\\;", ";")
     return out
+}
+
+/* ---------------------------
+   RRULE expansion (WEEKLY)
+---------------------------- */
+
+// Expand weekly RRULE masters into concrete in-window instances, applying RECURRENCE-ID overrides.
+private List<Map> expandRecurringEvents(List<Map> events, Long windowStart, Long windowEnd, TimeZone calendarTz) {
+    if (!events) return []
+
+    // Overrides keyed by UID + recurrenceIdMs
+    Map<String, Map> overrides = [:]
+    events.findAll { it?.recurrenceIdMs instanceof Long }.each { ev ->
+        String k = "${ev.uid}@@${ev.recurrenceIdMs as Long}"
+        overrides[k] = ev
+    }
+
+    List<Map> out = []
+
+    // Pass through all events that are not RRULE masters (including override instances themselves)
+    events.each { ev ->
+        if (!ev) return
+        boolean isMasterWithRrule = (ev.rrule instanceof String) && !(ev.recurrenceIdMs instanceof Long)
+        if (!isMasterWithRrule) out << ev
+    }
+
+    // Expand RRULE masters
+    events.findAll { it?.rrule && !(it?.recurrenceIdMs instanceof Long) }.each { master ->
+        out.addAll(expandWeeklyMaster(master, windowStart, windowEnd, calendarTz, overrides))
+    }
+
+    // Sort and return
+    out = out.findAll { it?.startMs && it?.endMs }
+             .sort { a, b -> (a.startMs as Long) <=> (b.startMs as Long) }
+
+    return out
+}
+
+// Supports common Outlook patterns: FREQ=WEEKLY;INTERVAL=...;BYDAY=...;UNTIL=...;WKST=...
+private List<Map> expandWeeklyMaster(Map master, Long windowStart, Long windowEnd, TimeZone calendarTz, Map<String, Map> overrides) {
+    List<Map> out = []
+    String rrule = (master.rrule as String)
+    Map rr = parseRrule(rrule)
+    if (!rr) return out
+
+    if ((rr.FREQ ?: "").toUpperCase() != "WEEKLY") {
+        debugAdd("RRULE unsupported FREQ='${rr.FREQ}' uid='${master.uid}' summary='${master.summary}'")
+        return out
+    }
+
+    Integer interval = safeInt(rr.INTERVAL, 1)
+    if (interval < 1) interval = 1
+
+    // BYDAY list; if missing, default to DTSTART weekday
+    List<String> byday = []
+    if (rr.BYDAY) {
+        byday = (rr.BYDAY as String).split(",").collect { it.trim().toUpperCase() }.findAll { it }
+    }
+
+    TimeZone tzRec = tzFromId(master.recTzId as String) ?: (calendarTz ?: hubTz())
+
+    Calendar cStart = Calendar.getInstance(tzRec)
+    cStart.setTimeInMillis(master.startMs as Long)
+
+    if (!byday || byday.size() == 0) {
+        byday = [dowToByday(cStart.get(Calendar.DAY_OF_WEEK))]
+    }
+
+    // Local time components from DTSTART
+    Integer hh = cStart.get(Calendar.HOUR_OF_DAY)
+    Integer mm = cStart.get(Calendar.MINUTE)
+    Integer ss = cStart.get(Calendar.SECOND)
+
+    // UNTIL handling
+    Long untilMs = null
+    if (rr.UNTIL) {
+        untilMs = parseUntilMs(rr.UNTIL as String, tzRec, calendarTz)
+    }
+
+    // WKST (week start) for interval alignment
+    Integer wkst = bydayToCalDow((rr.WKST ?: "SU").toString().trim().toUpperCase())
+    if (!wkst) wkst = Calendar.SUNDAY
+
+    Long masterStartMs = master.startMs as Long
+    Long durationMs = (master.durationMs instanceof Long) ? (master.durationMs as Long) : ((master.endMs as Long) - (master.startMs as Long))
+
+    // Iterate day-by-day across the window in tzRec (inclusive bounds)
+    Calendar day = Calendar.getInstance(tzRec)
+    day.setTimeInMillis(windowStart)
+    day.set(Calendar.HOUR_OF_DAY, 0)
+    day.set(Calendar.MINUTE, 0)
+    day.set(Calendar.SECOND, 0)
+    day.set(Calendar.MILLISECOND, 0)
+
+    Calendar endDay = Calendar.getInstance(tzRec)
+    endDay.setTimeInMillis(windowEnd)
+    endDay.set(Calendar.HOUR_OF_DAY, 23)
+    endDay.set(Calendar.MINUTE, 59)
+    endDay.set(Calendar.SECOND, 59)
+    endDay.set(Calendar.MILLISECOND, 999)
+
+    Long baseWeekStart = weekStartMs(cStart, wkst)
+
+    while (day.getTimeInMillis() <= endDay.getTimeInMillis()) {
+        String bd = dowToByday(day.get(Calendar.DAY_OF_WEEK))
+        if (byday.contains(bd)) {
+            Calendar occ = Calendar.getInstance(tzRec)
+            occ.setTimeInMillis(day.getTimeInMillis())
+            occ.set(Calendar.HOUR_OF_DAY, hh)
+            occ.set(Calendar.MINUTE, mm)
+            occ.set(Calendar.SECOND, ss)
+            occ.set(Calendar.MILLISECOND, 0)
+
+            Long occStart = occ.getTimeInMillis()
+            if (occStart >= masterStartMs) {
+                Long occWeekStart = weekStartMs(occ, wkst)
+                Long weeks = Math.round((occWeekStart - baseWeekStart) / 604800000.0d)
+                if (weeks >= 0 && (weeks % interval) == 0) {
+                    if (!untilMs || occStart <= untilMs) {
+                        Long occEnd = occStart + durationMs
+
+                        // Apply override if present
+                        String key = "${master.uid}@@${occStart}"
+                        Map ov = overrides[key]
+
+                        if (ov) {
+                            if (((ov.status ?: "") as String).toUpperCase() != "CANCELLED") {
+                                out << ov
+                            }
+                        } else {
+                            Map gen = [:] + master
+                            gen.startMs = occStart
+                            gen.endMs = occEnd
+                            gen.durationMs = durationMs
+                            gen.rrule = null
+                            gen.recurrenceIdMs = occStart
+                            gen.generated = true
+                            out << gen
+                        }
+                    }
+                }
+            }
+        }
+        day.add(Calendar.DATE, 1)
+    }
+
+    if (out && out.size() > 0) {
+        debugAdd("RRULE expanded '${master.summary}' instances=${out.size()} uid='${master.uid}'")
+    }
+    return out
+}
+
+private Map parseRrule(String rrule) {
+    if (!rrule) return null
+    Map m = [:]
+    rrule.split(";").each { seg ->
+        if (!seg) return
+        Integer i = seg.indexOf("=")
+        if (i > 0) {
+            String k = seg.substring(0, i).trim().toUpperCase()
+            String v = seg.substring(i + 1).trim()
+            if (k) m[k] = v
+        }
+    }
+    return m
+}
+
+private Long parseUntilMs(String raw, TimeZone tzRec, TimeZone calendarTz) {
+    if (!raw) return null
+    String v = raw.trim()
+    if (v.endsWith("Z")) {
+        Date d = tryParse(v, "yyyyMMdd'T'HHmmss'Z'", TimeZone.getTimeZone("UTC"))
+        if (!d) d = tryParse(v, "yyyyMMdd'T'HHmm'Z'", TimeZone.getTimeZone("UTC"))
+        return d ? d.time : null
+    }
+    Date d2 = parseICalDate(v, tzRec, calendarTz)
+    return d2 ? d2.time : null
+}
+
+private Integer bydayToCalDow(String byday) {
+    switch (byday) {
+        case "SU": return Calendar.SUNDAY
+        case "MO": return Calendar.MONDAY
+        case "TU": return Calendar.TUESDAY
+        case "WE": return Calendar.WEDNESDAY
+        case "TH": return Calendar.THURSDAY
+        case "FR": return Calendar.FRIDAY
+        case "SA": return Calendar.SATURDAY
+        default: return null
+    }
+}
+
+private String dowToByday(Integer calDow) {
+    switch (calDow) {
+        case Calendar.SUNDAY: return "SU"
+        case Calendar.MONDAY: return "MO"
+        case Calendar.TUESDAY: return "TU"
+        case Calendar.WEDNESDAY: return "WE"
+        case Calendar.THURSDAY: return "TH"
+        case Calendar.FRIDAY: return "FR"
+        case Calendar.SATURDAY: return "SA"
+        default: return "SU"
+    }
+}
+
+// Week start anchored at noon to reduce DST edge risk
+private Long weekStartMs(Calendar any, Integer wkstDow) {
+    Calendar c = (Calendar) any.clone()
+    while (c.get(Calendar.DAY_OF_WEEK) != wkstDow) {
+        c.add(Calendar.DATE, -1)
+    }
+    c.set(Calendar.HOUR_OF_DAY, 12)
+    c.set(Calendar.MINUTE, 0)
+    c.set(Calendar.SECOND, 0)
+    c.set(Calendar.MILLISECOND, 0)
+    return c.getTimeInMillis()
+}
+
+private TimeZone tzFromId(String id) {
+    if (!id) return null
+    try {
+        TimeZone tz = TimeZone.getTimeZone(id)
+        if (tz?.getID() == "GMT" && id != "GMT") return null
+        return tz
+    } catch (e) {
+        return null
+    }
 }
 
 /* ---------------------------
