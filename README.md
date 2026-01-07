@@ -1,4 +1,4 @@
-# iCal Calendar Switch (Hubitat)
+# HE iCal Switch
 
 A Hubitat device driver that monitors a public iCal / ICS calendar feed and maps calendar activity to a virtual switch.
 
@@ -75,7 +75,7 @@ Private or authenticated calendar feeds are not supported.
 3. Paste the driver code
 4. Click Save
 5. Create a Virtual Device
-6. Select driver: iCal Calendar Switch (Hub TZ)
+6. Select driver: HE iCal Switch
 
 ---
 
@@ -173,7 +173,7 @@ Events missing:
 ## Author
 
 Chris Truitt  
-GitHub: https://github.com/truittgit/ical_hubitat  
+GitHub: https://github.com/truittchris/he_ical_switch  
 Contact: hello@christruitt.com  
 
 Find this useful?  Tips are gladly accepted!

@@ -1,19 +1,19 @@
 {
-  "packageName": "iCal Calendar Switch",
+  "packageName": "HE iCal Switch",
   "author": "Chris Truitt",
-  "version": "1.0.1",
+  "version": "1.0.0",
   "minimumHEVersion": "2.1.9",
-  "dateReleased": "2026-01-06",
-  "licenseFile": "https://raw.githubusercontent.com/truittgit/ical_hubitat_calendar_switch/main/LICENSE",
-  "releaseNotes": "See CHANGELOG.md in the GitHub repository.",
-  "documentationLink": "https://github.com/truittgit/ical_hubitat_calendar_switch#readme",
+  "dateReleased": "2026-01-07",
+  "licenseFile": "https://raw.githubusercontent.com/truittchris/he_ical_switch/main/LICENSE",
+  "releaseNotes": "Initial public release.",
+  "documentationLink": "https://github.com/truittchris/he_ical_switch#readme",
   "communityLink": "https://community.hubitat.com/",
   "drivers": [
     {
       "id": "38939eb3-3fc8-4839-bed1-a7517940775c",
-      "name": "iCal Calendar Switch",
-      "namespace": "ctc",
-      "location": "https://raw.githubusercontent.com/truittgit/ical_hubitat_calendar_switch/main/ical_hubitat.groovy",
+      "name": "HE iCal Switch",
+      "namespace": "truittchris",
+      "location": "https://raw.githubusercontent.com/truittchris/he_ical_switch/main/he_ical_switch.groovy",
       "required": true,
       "description": "Monitors an iCal/ICS feed and maps eligible calendar activity to a virtual switch, respecting the hub timezone."
     }

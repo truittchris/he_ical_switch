@@ -1,8 +1,8 @@
 /**
- *  iCal Hubitat Calendar Switch
+ *  HE iCal Switch
  *
  *  Author: Chris Truitt
- *  GitHub:  https://github.com/truittgit/ical_hubitat_calendar_switch
+ *  GitHub:  https://github.com/truittchris/he_ical_switch
  *  Contact: hello@christruitt.com
  *  Find this useful?  Tips are gladly accepted!
  *  https://www.christruitt.com/tip-jar
@@ -39,7 +39,7 @@ import java.text.SimpleDateFormat
 import java.util.Calendar
 
 metadata {
-    definition(name: "iCal Calendar Switch", namespace: "ctc", author: "Chris Truitt") {
+    definition(name: "HE iCal Switch", namespace: "truittchris", author: "Chris Truitt") {
         capability "Switch"
         capability "Refresh"
 

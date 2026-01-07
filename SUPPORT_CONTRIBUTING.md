@@ -12,33 +12,38 @@ If something does not behave as expected:
 
 1. Confirm your ICS URL is publicly accessible
 2. Check the device attributes:
-   - nextEvents
-   - activeSummary
-   - calendarTz
+
+   * nextEvents
+   * activeSummary
+   * calendarTz
+
 3. Enable debug logging and review rawDebug
 4. Temporarily disable filters to isolate behavior
 
 ## Reporting Issues
 
 Please use GitHub Issues:
-https://github.com/truittgit/ical_hubitat/issues
+https://github.com/truittchris/he_ical_switch/issues
 
 When reporting an issue, include:
-- Calendar provider (Outlook, Google, etc.)
-- Example event timing
-- Relevant device attributes
-- Redacted debug output if possible
+
+* Calendar provider (Outlook, Google, etc.)
+* Example event timing
+* Relevant device attributes
+* Redacted debug output if possible
 
 ## Contributions
 
 Pull requests are welcome.
 
 Guidelines:
-- Keep changes focused and minimal
-- Preserve existing behavior and defaults
-- Avoid adding UI complexity
-- Maintain hub-timezone-first behavior
-- Keep the driver suitable for long-term maintenance
+
+* Keep changes focused and minimal
+* Preserve existing behavior and defaults
+* Avoid adding UI complexity
+* Maintain hub-timezone-first behavior
+* Keep the driver suitable for long-term maintenance
 
 Significant feature requests should be discussed via an issue before
 submitting a pull request.
+
