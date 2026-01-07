@@ -13,7 +13,7 @@
       "id": "38939eb3-3fc8-4839-bed1-a7517940775c",
       "name": "HE iCal Switch",
       "namespace": "truittchris",
-      "location": "https://raw.githubusercontent.com/truittchris/he_ical_switch/main/he_ical_switch.groovy",
+      "location": "https://raw.githubusercontent.com/truittchris/he_ical_switch/main/drivers/he_ical_switch.groovy",
       "required": true,
       "description": "Monitors an iCal/ICS feed and maps eligible calendar activity to a virtual switch, respecting the hub timezone."
     }
