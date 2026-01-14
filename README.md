@@ -175,6 +175,7 @@ Events missing:
 Chris Truitt  
 GitHub: https://github.com/truittchris/he_ical_switch  
 Contact: hello@christruitt.com  
+Web: https://christruitt.com
 
 Find this useful?  Tips are gladly accepted!
 
