@@ -11,6 +11,8 @@ This driver is designed to be reliable with real-world calendars, including Outl
 ## Find this useful?  Tips are gladly accepted!
 
 https://www.christruitt.com/tip-jar
+Web: https://christruitt.com
+Email: hello@christruitt.com
 
 ---
 
